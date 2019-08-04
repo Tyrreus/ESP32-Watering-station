@@ -1,143 +1,211 @@
 /* Watering station
 
-This software was created to build watering station used to water tomatoes.
+This software was created to build watering station for plants.
+
+This version can handle many channels to do watering when soil moisture will
+drop below specific level (can be set for each channel).
 
 */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 
-#define DEFAULT_VREF    1100        //Use adc2_vref_to_gpio() to obtain a better estimate
-#define NO_OF_SAMPLES   64          //Multisampling
+static const int kNoOfSamples = 64;
+static const adc_atten_t kAtten = ADC_ATTEN_DB_11;
+static const gpio_num_t kPumpGPIO = 14;
+static const gpio_num_t kTankGPIO = 13;
+static const gpio_num_t kEmptyLedIndicatorGPIO = 23;
+static const gpio_num_t kValve1GPIO = 25;
+static const gpio_num_t kValve2GPIO = 26;
+static const gpio_num_t kValve3GPIO = 27;
+static const uint32_t kCheckTimeSec = 1;
+static const uint32_t kMsInSec = 1000;
 
-#define GPIO_PUMP    14
-#define GPIO_VALVE_1 25
-#define GPIO_VALVE_2 26
-#define GPIO_VALVE_3 27
-#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_PUMP) | (1ULL<<GPIO_VALVE_1) | (1ULL<<GPIO_VALVE_2) | (1ULL<<GPIO_VALVE_3))
+static uint64_t current_gpio_output_pin_mask = 0;
+static uint64_t current_gpio_input_pin_mask = 0;
+static size_t waterting_channels_cnt = 0;
 
-#define GPIO_WATER_TANK 12
-#define GPIO_INPUT_PIN_SEL  ((1ULL<<GPIO_WATER_TANK))
+typedef struct {
+    gpio_num_t pump_gpio;
+    void (*start)(void *self);
+    void (*stop)(void *self);
+} tPump;
 
+typedef struct {
+    gpio_num_t tank_gpio;
+    bool (*isEmpty)(void *self);
+} tTank;
 
-static esp_adc_cal_characteristics_t *adc_chars;
-static const adc_channel_t adc_mois_1 = ADC_CHANNEL_5; // GPIO_33
-static const adc_channel_t adc_mois_2 = ADC_CHANNEL_6; // GPIO_34
-static const adc_channel_t adc_mois_3 = ADC_CHANNEL_7; // GPIO_35
+typedef struct {
+    gpio_num_t valve_gpio;
+    void (*open)(const void *self);
+    void (*close)(const void *self);
+} tValve;
 
-static const adc_atten_t atten = ADC_ATTEN_DB_11;
-static const adc_unit_t unit = ADC_UNIT_1;
+typedef struct {
+    tValve valve;
+    tPump *pump;
+    tTank *tank;
+    adc_channel_t adc_ch;
+    uint8_t watering_time_sec;
+    uint8_t min_moisture;
+    uint32_t (*getMoisture)(const void* self);
+} tWateringChannel;
 
-static void check_efuse()
-{
-    //Check TP is burned into eFuse
-    if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK) {
-        printf("eFuse Two Point: Supported\n");
-    } else {
-        printf("eFuse Two Point: NOT supported\n");
-    }
-
-    //Check Vref is burned into eFuse
-    if (esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_VREF) == ESP_OK) {
-        printf("eFuse Vref: Supported\n");
-    } else {
-        printf("eFuse Vref: NOT supported\n");
-    }
-}
-
-static void print_char_val_type(esp_adc_cal_value_t val_type)
-{
-    if (val_type == ESP_ADC_CAL_VAL_EFUSE_TP) {
-        printf("Characterized using Two Point Value\n");
-    } else if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
-        printf("Characterized using eFuse Vref\n");
-    } else {
-        printf("Characterized using Default Vref\n");
-    }
-}
-
-static void initAdc() {
-    //Check if Two Point or Vref are burned into eFuse
-    check_efuse();
-    adc1_config_width(ADC_WIDTH_BIT_12);
-
-    adc1_config_channel_atten(adc_mois_1, atten);
-    adc1_config_channel_atten(adc_mois_2, atten);
-    adc1_config_channel_atten(adc_mois_3, atten);
-
-    //Characterize ADC
-    adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
-    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(unit, atten, ADC_WIDTH_BIT_12, DEFAULT_VREF, adc_chars);
-    print_char_val_type(val_type);
-}
-
-static void initGpio() {
-    gpio_config_t io_conf;
-    //disable interrupt
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    //bit mask of the pins that you want to set,e.g.GPIO18/19
-    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
-    //disable pull-down mode
-    io_conf.pull_down_en = 0;
-    //disable pull-up mode
-    io_conf.pull_up_en = 1;
-    //configure GPIO with the given settings
-    gpio_config(&io_conf);
-
-    io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
-    //set as input mode
-    io_conf.mode = GPIO_MODE_INPUT;
-    //enable pull-up mode
-    io_conf.pull_up_en = 1;
-    gpio_config(&io_conf);
-}
-
-static uint32_t getMoisture(adc_channel_t ch) {
+static uint32_t read_adc(const adc_channel_t ch) {
     uint32_t adc_reading = 0;
-    for (int i = 0; i < NO_OF_SAMPLES; i++) {
+    for (int i = 0; i < kNoOfSamples; i++) {
         adc_reading += adc1_get_raw((adc1_channel_t)ch);
     }
-    adc_reading /= NO_OF_SAMPLES;
-    return ((adc_reading * 100) / 4095);
+    return adc_reading /= kNoOfSamples;
 }
 
-static void water_for(gpio_num_t valve_gpio, uint32_t sec) {
-    gpio_set_level(valve_gpio, 1);
-    gpio_set_level(GPIO_PUMP, 1);
-    vTaskDelay(pdMS_TO_TICKS(sec*1000));
-    gpio_set_level(valve_gpio, 0);
-    gpio_set_level(GPIO_PUMP, 0);
+static uint32_t getMoist(const tWateringChannel *ch) {
+    uint32_t moist = read_adc(ch->adc_ch);
+    return ((moist * 100) / 4095); // Calculate percent without fraction.
 }
 
+static void initAdcChannel(const adc_channel_t adc_ch) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(adc_ch, kAtten);
+}
+
+static void initGpioAsOutput(const gpio_num_t gpio) {
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    current_gpio_output_pin_mask |= (1ULL<<gpio);
+    io_conf.pin_bit_mask = current_gpio_output_pin_mask;
+    io_conf.pull_down_en = 0;
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+}
+
+static void initGpioAsInpit(const gpio_num_t gpio) {
+    gpio_config_t io_conf;
+    current_gpio_input_pin_mask |= (1ULL<<gpio);
+    io_conf.pin_bit_mask = current_gpio_input_pin_mask;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = 1;
+    gpio_config(&io_conf);
+}
+
+static void openValve(tValve *valve) {
+    gpio_set_level(valve->valve_gpio, 1);
+}
+
+static void closeValve(tValve *valve) {
+    gpio_set_level(valve->valve_gpio, 0);
+}
+
+static void startPump(tPump *pump) {
+    gpio_set_level(pump->pump_gpio, 1);
+}
+
+static void stopPump(tPump *pump) {
+    gpio_set_level(pump->pump_gpio, 0);
+}
+
+static bool isTankEmpty(tTank *tank) {
+    if (gpio_get_level(tank->tank_gpio)) {
+        return true;
+    }
+    return false;
+}
+
+void initChanel(tWateringChannel *ch) {
+    initGpioAsOutput(ch->valve.valve_gpio);
+    initGpioAsOutput(ch->pump->pump_gpio);
+    initGpioAsInpit(ch->tank->tank_gpio);
+    initAdcChannel(ch->adc_ch);
+}
+
+void checkAndWaterSingle(tWateringChannel *ch) {
+    uint32_t curr_moisture = ch->getMoisture(ch);
+    tPump *pump = ch->pump;
+    tTank *tank = ch->tank;
+    tValve *valve = &ch->valve;
+
+    if (!tank->isEmpty(tank)) {
+        gpio_set_level(kEmptyLedIndicatorGPIO, 0);
+        if (curr_moisture < ch->min_moisture) {
+            valve->open(valve);
+            pump->start(pump);
+            vTaskDelay(pdMS_TO_TICKS(ch->watering_time_sec * kMsInSec));
+            pump->stop(pump);
+            valve->close(valve);
+        }
+    } else {
+        printf("Tank is empty!\n");
+        gpio_set_level(kEmptyLedIndicatorGPIO, 1);
+        // Light LED up.
+    }
+}
+
+void checkAndWaterAll(tWateringChannel *ch) {
+    for (size_t i = 0; i < waterting_channels_cnt; ++i) {
+        checkAndWaterSingle(&ch[i]);
+    }
+}
 
 void app_main()
 {
-    initAdc();
-    initGpio();
+    tPump common_pump = { .pump_gpio = kPumpGPIO, .start = (void*) startPump, .stop = (void*) stopPump};
+    tTank common_tank = { .tank_gpio = kTankGPIO, .isEmpty = (void*) isTankEmpty};
 
-    while (1) {
-        printf("Moisture in percent, metter_1: %d metter_2: %d metter_3: %d\n", getMoisture(adc_mois_1), getMoisture(adc_mois_2), getMoisture(adc_mois_3));
+    tWateringChannel channels[] = {
+            {
+                .valve = { .valve_gpio = kValve1GPIO, .open = (void*) openValve, .close = (void*) closeValve},
+                .pump = &common_pump,
+                .tank = &common_tank,
+                .adc_ch = ADC_CHANNEL_5,
+                .watering_time_sec = 5,
+                .min_moisture = 50,
+                .getMoisture = (void*) getMoist
+            },
+            {
+                .valve = { .valve_gpio = kValve2GPIO, .open = (void*) openValve, .close = (void*) closeValve},
+                .pump = &common_pump,
+                .tank = &common_tank,
+                .adc_ch = ADC_CHANNEL_6,
+                .watering_time_sec = 5,
+                .min_moisture = 50,
+                .getMoisture = (void*) getMoist
+            },
+            {
+                .valve = { .valve_gpio = kValve3GPIO, .open = (void*) openValve, .close = (void*) closeValve},
+                .pump = &common_pump,
+                .tank = &common_tank,
+                .adc_ch = ADC_CHANNEL_7,
+                .watering_time_sec = 5,
+                .min_moisture = 50,
+                .getMoisture = (void*) getMoist
+            },
+    };
 
-        if (!gpio_get_level(GPIO_WATER_TANK)) {
-            printf("There is no water left in tank. Abort.\n");
-        }
+    waterting_channels_cnt = (sizeof(channels)/sizeof(tWateringChannel));
 
-        if (getMoisture(adc_mois_1) <= 50 && gpio_get_level(GPIO_WATER_TANK)) {
-            water_for(GPIO_VALVE_1, 5);
-        }
-        if (getMoisture(adc_mois_2) <= 50 && gpio_get_level(GPIO_WATER_TANK)) {
-            water_for(GPIO_VALVE_2, 5);
-        }
-        if (getMoisture(adc_mois_3) <= 50 && gpio_get_level(GPIO_WATER_TANK)) {
-            water_for(GPIO_VALVE_3, 5);
-        }
+    for (size_t s = 0; s < waterting_channels_cnt; ++s) {
+        initChanel(&channels[s]);
+    }
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+    initGpioAsOutput(kEmptyLedIndicatorGPIO);
+
+    while(1) {
+        printf("Moisture: ");
+        for (size_t s = 0; s < waterting_channels_cnt; ++s) {
+            printf("channel[%d]: %d, ", s, channels[s].getMoisture(&channels[s]));
+        }
+        printf("\n");
+
+        checkAndWaterAll(channels);
+
+        vTaskDelay(pdMS_TO_TICKS(kCheckTimeSec * kMsInSec));
     }
 }
 
