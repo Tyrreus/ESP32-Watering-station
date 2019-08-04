@@ -6,6 +6,18 @@ Description:
 
 This piece of software is used to keep the pots wet in garden.
 
+How to connect:
+---------------
+* Moisture sensor 1 - GPIO 33
+* Moisture sensor 2 - GPIO 34
+* Moisture sensor 3 - GPIO 35
+* Relay 1 (electro valve) - GPIO 25
+* Relay 2 (electro valve) - GPIO 26
+* Relay 3 (electro valve) - GPIO 27
+* Pump relay - GPIO 14
+* Water level sensor - GPIO 13
+* Lack of water LED - GPIO 23 (remember about current limitation (may be 3k3 resistor)
+
 Project assumptions:
 --------------------
 
